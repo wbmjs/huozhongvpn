@@ -2,7 +2,7 @@ name: Fetch VLESS Links
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'   # 每天 UTC 0 点运行
+    - cron: '0 12 */2 * *'   # UTC 12:00 = 北京时间 20:00
   workflow_dispatch:       # 支持手动触发
 
 jobs:
