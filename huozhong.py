@@ -3,150 +3,133 @@
 
 import os
 import sys
-import requests
 import json
-import urllib.parse
 import time
-import urllib3
-from requests.exceptions import RequestException
-from typing import List, Dict, Optional
+import urllib.parse
+import logging
+from functools import wraps
+from typing import List, Dict, Optional, Any
 
-# 禁用 SSL 警告（因为使用 verify=False）
+import requests
+import urllib3
+
+# 禁用 SSL 警告（因使用 verify=False）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==================== 配置区（从环境变量读取） ====================
+# ==================== 配置 ====================
 BASE_URL = "https://server1a.hzzf.cc/api/nodesystem/user"
 AUTH_URL = "https://server2k.hzzf.cc/realms/vpn_application/protocol/openid-connect/token"
 
-# 从环境变量获取敏感信息
+# 从环境变量读取敏感信息
 USERNAME = os.environ.get("HZ_USERNAME")
 PASSWORD = os.environ.get("HZ_PASSWORD")
-CLIENT_ID = os.environ.get("HZ_CLIENT_ID", "vpn-user")  # 保留默认值
+CLIENT_ID = os.environ.get("HZ_CLIENT_ID", "vpn-user")
 CLIENT_SECRET = os.environ.get("HZ_CLIENT_SECRET")
 
-# 检查必需的环境变量
-if not all([USERNAME, PASSWORD, CLIENT_SECRET]):
-    print("错误：缺少必需的环境变量 HZ_USERNAME, HZ_PASSWORD, HZ_CLIENT_SECRET")
-    sys.exit(1)
-
-# 输出文件（使用相对路径，适配 Ubuntu 运行环境）
+# 输出文件
 OUTPUT_FILE = "huozhong_vless_links.txt"
 
-# ==================== SSL 配置 ====================
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# ==================== 会话与重试装饰器 ====================
 session = requests.Session()
 session.verify = False
 
+def retry_request(max_retries: int = 4, backoff_factor: float = 2.0, exceptions=(requests.RequestException,)):
+    """
+    重试装饰器，用于处理网络请求异常。
+    :param max_retries: 最大重试次数
+    :param backoff_factor: 退避因子
+    :param exceptions: 需要捕获并重试的异常类型
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == max_retries:
+                        logger.error(f"重试 {max_retries} 次后失败: {e}")
+                        raise
+                    wait = backoff_factor ** (attempt + 1) * (0.5 + 0.5 * (time.time() % 1))  # 添加随机抖动
+                    logger.warning(f"请求失败 (尝试 {attempt+1}/{max_retries+1}): {e}，等待 {wait:.2f}s 后重试")
+                    time.sleep(wait)
+        return wrapper
+    return decorator
 
+# ==================== 登录与 Token 获取 ====================
 def login_and_get_token() -> Optional[str]:
-    """使用用户名密码登录，获取新的 Bearer Token"""
-    print("正在尝试登录获取新 Token...")
+    """使用用户名密码登录，获取 Bearer Token"""
+    logger.info("正在获取新 Token...")
     
     payload = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "password",
         "username": USERNAME,
-        "password": PASSWORD
+        "password": PASSWORD,
     }
-    
     headers = {
         "User-Agent": "ktor-client",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "accept-charset": "UTF-8",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
-    
+
     try:
         resp = session.post(AUTH_URL, data=payload, headers=headers, timeout=15)
-        print(f"登录状态码: {resp.status_code}")
-        
         if resp.status_code != 200:
-            print(f"登录失败: {resp.text[:300]}")
+            logger.error(f"登录失败，状态码 {resp.status_code}: {resp.text[:300]}")
             return None
-        
         data = resp.json()
         token = data.get("access_token")
         if not token:
-            print("响应中无 access_token")
+            logger.error("响应中无 access_token")
             return None
-        
-        expires_in = data.get("expires_in", 0)
-        print(f"登录成功！新 Token 获取成功，有效期约 {expires_in//60} 分钟")
+        logger.info(f"Token 获取成功，有效期 {data.get('expires_in', 0)//60} 分钟")
         return token
-    
     except Exception as e:
-        print(f"登录异常: {str(e)}")
+        logger.error(f"登录异常: {e}")
         return None
 
-
-def get_node_list(token: str, max_retries: int = 4, backoff_factor: float = 2.0) -> List[Dict]:
-    """获取节点列表（带重试和 SSL 错误处理）"""
-    print("正在请求 nodeList 接口...")
+# ==================== 节点列表获取 ====================
+@retry_request(max_retries=4, backoff_factor=2.0)
+def get_node_list(token: str) -> List[Dict]:
+    """获取节点列表（带重试）"""
+    logger.info("正在获取节点列表...")
     headers = {
         "User-Agent": "ktor-client",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "authorization": f"Bearer {token}",
         "accept-charset": "UTF-8",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    
     url = f"{BASE_URL}/nodeList?platform=android"
     
-    for attempt in range(max_retries + 1):
-        try:
-            resp = session.post(url, headers=headers, json={}, timeout=15)
-            print(f"状态码: {resp.status_code}")
-            
-            if resp.status_code != 200:
-                print(f"错误响应: {resp.text[:300]}")
-                if attempt == max_retries:
-                    return []
-                continue
-            
-            data = resp.json()
-            if not isinstance(data, list):
-                print("响应不是列表格式")
-                return []
-            
-            print(f"成功获取 {len(data)} 个节点")
-            return data
-            
-        except requests.exceptions.SSLError as e:
-            print(f"SSL 错误 (尝试 {attempt+1}/{max_retries+1}): {str(e)}")
-            if attempt == max_retries:
-                print("SSL 错误重试失败，可能是服务器 TLS 配置问题")
-                return []
-            
-            wait_time = backoff_factor ** (attempt + 1)
-            print(f"等待 {wait_time:.1f} 秒后重试...")
-            time.sleep(wait_time)
-            
-        except Exception as e:
-            print(f"获取节点列表异常 (尝试 {attempt+1}/{max_retries+1}): {str(e)}")
-            if attempt == max_retries:
-                return []
-            
-            wait_time = backoff_factor ** attempt
-            print(f"等待 {wait_time:.1f} 秒后重试...")
-            time.sleep(wait_time)
-    
-    return []
+    resp = session.post(url, headers=headers, json={}, timeout=15)
+    if resp.status_code != 200:
+        logger.error(f"nodeList 请求失败: {resp.status_code} {resp.text[:300]}")
+        raise requests.RequestException(f"HTTP {resp.status_code}")
+    data = resp.json()
+    if not isinstance(data, list):
+        logger.error("响应不是列表格式")
+        return []
+    logger.info(f"成功获取 {len(data)} 个节点")
+    return data
 
-
-def extract_node_name(node: Dict) -> str:
-    """从 nodeList 提取节点名称，用于备注"""
-    if name := node.get("nameCn"):
-        return name.strip()
-    if name := node.get("nameEn"):
-        return name.strip()
-    if region := node.get("regionNameCn"):
-        return f"{region.strip()} 节点"
-    return f"Node-{node.get('nodeId', '未知')}"
-
-
-def get_client_config(node_id: int, token: str, max_retries: int = 4, backoff_factor: float = 2.0) -> Optional[Dict]:
+# ==================== 节点配置获取 ====================
+@retry_request(max_retries=4, backoff_factor=2.0)
+def get_client_config(node_id: int, token: str) -> Optional[Dict]:
+    """获取单个节点的客户端配置"""
     url = f"{BASE_URL}/clientConfig"
     payload = {"nodeId": node_id}
     headers = {
@@ -155,48 +138,31 @@ def get_client_config(node_id: int, token: str, max_retries: int = 4, backoff_fa
         "Accept-Encoding": "gzip",
         "authorization": f"Bearer {token}",
         "accept-charset": "UTF-8",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    
-    for attempt in range(max_retries + 1):
-        try:
-            resp = session.post(url, headers=headers, json=payload, timeout=12)
-            if resp.status_code == 200:
-                print(f"  node {node_id} 配置获取成功")
-                return resp.json()
-            else:
-                print(f"  node {node_id} HTTP {resp.status_code} (尝试 {attempt+1}/{max_retries+1})")
-                if attempt == max_retries:
-                    return None
-        
-        except requests.exceptions.SSLError as e:
-            print(f"  node {node_id} SSL 错误 (尝试 {attempt+1}/{max_retries+1}): {str(e)}")
-            if attempt == max_retries:
-                return None
-            
-            wait_time = backoff_factor ** (attempt + 1)
-            print(f"  等待 {wait_time:.1f} 秒后重试...")
-            time.sleep(wait_time)
-            
-        except RequestException as e:
-            print(f"  node {node_id} 连接异常 (尝试 {attempt+1}/{max_retries+1}): {str(e)}")
-            if attempt == max_retries:
-                print(f"  node {node_id} 重试 {max_retries} 次后仍失败，跳过")
-                return None
-            
-            wait_time = backoff_factor ** attempt
-            print(f"  等待 {wait_time:.1f} 秒后重试...")
-            time.sleep(wait_time)
-    
-    return None
+    resp = session.post(url, headers=headers, json=payload, timeout=12)
+    if resp.status_code != 200:
+        logger.warning(f"node {node_id} HTTP {resp.status_code}")
+        raise requests.RequestException(f"HTTP {resp.status_code}")
+    return resp.json()
 
+# ==================== 链接生成 ====================
+def extract_node_name(node: Dict) -> str:
+    """从节点信息提取名称"""
+    if name := node.get("nameCn"):
+        return name.strip()
+    if name := node.get("nameEn"):
+        return name.strip()
+    if region := node.get("regionNameCn"):
+        return f"{region.strip()} 节点"
+    return f"Node-{node.get('nodeId', '未知')}"
 
 def generate_vless_link(config: Dict, node_name: str) -> str:
     """生成 VLESS 链接（支持 reality 和普通 tls）"""
     vnext = config["settings"]["vnext"][0]
     user = vnext["users"][0]
     stream = config["streamSettings"]
-    
+
     if stream.get("security") == "reality":
         reality = stream["realitySettings"]
         params = {
@@ -207,77 +173,141 @@ def generate_vless_link(config: Dict, node_name: str) -> str:
             "fp": reality["fingerprint"],
             "type": stream["network"],
             "sni": reality["serverName"],
-            "sid": reality["shortId"]
+            "sid": reality["shortId"],
         }
     else:
         params = {"security": stream.get("security", "none")}
-    
+
     query = urllib.parse.urlencode(params)
     remark = urllib.parse.quote(node_name)
-    link = f"vless://{user['id']}@{vnext['address']}:{vnext['port']}?{query}#{remark}"
-    return link
+    return f"vless://{user['id']}@{vnext['address']}:{vnext['port']}?{query}#{remark}"
 
+def generate_trojan_link(config: Dict, node_name: str) -> str:
+    """
+    生成 Trojan 链接
+    配置示例：
+    {
+      "settings": {
+        "servers": [{"address": "...", "port": 28443, "password": "...", "email": "..."}]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {"serverName": "...", "allowInsecure": true, "fingerprint": "chrome"},
+        "grpcSettings": {"serviceName": "xVpnTrojanGrpcSvc7f3a", ...}
+      }
+    }
+    """
+    servers = config.get("settings", {}).get("servers", [])
+    if not servers:
+        raise ValueError("配置中缺少 servers 字段")
+    server = servers[0]
+    address = server.get("address")
+    port = server.get("port")
+    password = server.get("password")
+    if not all([address, port, password]):
+        raise ValueError("Trojan 服务器缺少 address/port/password")
 
-def save_link_only(link: str):
+    stream = config.get("streamSettings", {})
+    network = stream.get("network", "tcp")
+    security = stream.get("security", "")
+    tls_settings = stream.get("tlsSettings", {})
+    grpc_settings = stream.get("grpcSettings", {})
+
+    # 构建查询参数
+    params = {}
+    if security:
+        params["security"] = security
+    if tls_settings.get("allowInsecure") is not None:
+        params["allowInsecure"] = str(tls_settings["allowInsecure"]).lower()
+    if sni := tls_settings.get("serverName"):
+        params["sni"] = sni
+    if fp := tls_settings.get("fingerprint"):
+        params["fp"] = fp
+    if network:
+        params["type"] = network
+    if network == "grpc" and (svc := grpc_settings.get("serviceName")):
+        params["serviceName"] = svc
+
+    query = urllib.parse.urlencode(params)
+    remark = urllib.parse.quote(node_name)
+    return f"trojan://{password}@{address}:{port}?{query}#{remark}"
+
+def save_link(link: str):
+    """将链接追加写入输出文件"""
     with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
         f.write(f"{link}\n")
 
-
+# ==================== 主程序 ====================
 def main():
-    # 清空文件
+    # 检查环境变量
+    if not all([USERNAME, PASSWORD, CLIENT_SECRET]):
+        logger.error("缺少必需的环境变量: HZ_USERNAME, HZ_PASSWORD, HZ_CLIENT_SECRET")
+        sys.exit(1)
+
+    # 清空输出文件
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         pass
-    
-    print("火种VPN - 自动登录 + 提取 VLESS 链接 (GitHub Actions 版)")
-    print(f"输出文件: {OUTPUT_FILE} （纯链接格式）\n")
-    
-    # 步骤1: 尝试登录获取新 Token
+
+    logger.info("火种VPN - 自动登录 + 提取链接 (支持 VLESS / Trojan)")
+    logger.info(f"输出文件: {OUTPUT_FILE}")
+
+    # 1. 登录获取 Token
     token = login_and_get_token()
     if not token:
-        print("登录失败，无法继续。请检查环境变量中的凭证")
+        logger.error("登录失败，终止")
         sys.exit(1)
-    
-    nodes = get_node_list(token)
+
+    # 2. 获取节点列表
+    try:
+        nodes = get_node_list(token)
+    except Exception as e:
+        logger.error(f"获取节点列表失败: {e}")
+        sys.exit(1)
+
     if not nodes:
-        print("没有获取到任何节点，结束")
+        logger.warning("节点列表为空，退出")
         sys.exit(1)
-    
+
     success_count = 0
-    
     for node in nodes:
         node_id = node.get("nodeId")
         if not node_id:
             continue
-        
         node_name = extract_node_name(node)
-        
-        config = get_client_config(node_id, token)
+
+        try:
+            config = get_client_config(node_id, token)
+        except Exception as e:
+            logger.error(f"获取节点 {node_id} 配置失败: {e}")
+            continue
+
         if not config:
             continue
-        
-        protocol = config.get("protocol", "").lower()
-        
-        # 仅处理 VLESS 协议，跳过其他（包括 vmess）
-        if protocol != "vless":
-            continue
-        
-        try:
-            link = generate_vless_link(config, node_name)
-            save_link_only(link)
-            success_count += 1
-            print(f"已保存 VLESS 节点 {node_id} ({node_name}) → {link[:60]}...")
-        
-        except Exception as e:
-            print(f"生成 VLESS 链接失败 (node {node_id}): {str(e)}")
-    
-    print(f"\n完成！共保存 {success_count} 条 VLESS 链接")
-    print(f"文件路径: {OUTPUT_FILE}")
-    
-    # 如果一条链接都没生成，视为失败
-    if success_count == 0:
-        print("警告：未生成任何有效 VLESS 链接")
-        sys.exit(1)
 
+        protocol = config.get("protocol", "").lower()
+        link = None
+        try:
+            if protocol == "vless":
+                link = generate_vless_link(config, node_name)
+            elif protocol == "trojan":
+                link = generate_trojan_link(config, node_name)
+            else:
+                logger.debug(f"跳过不支持的协议 {protocol} (node {node_id})")
+                continue
+        except Exception as e:
+            logger.error(f"生成 {protocol} 链接失败 (node {node_id}): {e}")
+            continue
+
+        if link:
+            save_link(link)
+            success_count += 1
+            logger.info(f"已保存 {protocol.upper()} 节点 {node_id} ({node_name}) → {link[:60]}...")
+
+    logger.info(f"完成！共保存 {success_count} 条链接")
+    if success_count == 0:
+        logger.error("未生成任何有效链接，视为失败")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
