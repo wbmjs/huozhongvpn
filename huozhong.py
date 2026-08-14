@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Any
 import requests
 import urllib3
 
-# 禁用 SSL 警告（因使用 verify=False）
+# 禁用 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==================== 配置（多地址容灾） ====================
@@ -48,12 +48,6 @@ session = requests.Session()
 session.verify = False
 
 def retry_request(max_retries: int = 4, backoff_factor: float = 2.0, exceptions=(requests.RequestException,)):
-    """
-    重试装饰器，用于处理网络请求异常。
-    :param max_retries: 最大重试次数
-    :param backoff_factor: 退避因子
-    :param exceptions: 需要捕获并重试的异常类型
-    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -64,17 +58,15 @@ def retry_request(max_retries: int = 4, backoff_factor: float = 2.0, exceptions=
                     if attempt == max_retries:
                         logger.error(f"重试 {max_retries} 次后失败: {e}")
                         raise
-                    wait = backoff_factor ** (attempt + 1) * (0.5 + 0.5 * (time.time() % 1))  # 添加随机抖动
+                    wait = backoff_factor ** (attempt + 1) * (0.5 + 0.5 * (time.time() % 1))
                     logger.warning(f"请求失败 (尝试 {attempt+1}/{max_retries+1}): {e}，等待 {wait:.2f}s 后重试")
                     time.sleep(wait)
         return wrapper
     return decorator
 
-# ==================== 登录与 Token 获取（多地址容灾） ====================
+# ==================== 登录（多地址容灾） ====================
 def login_and_get_token() -> Optional[str]:
-    """使用用户名密码登录，获取 Bearer Token，自动尝试多个认证服务器"""
     logger.info("正在获取新 Token...")
-    
     payload = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -89,7 +81,6 @@ def login_and_get_token() -> Optional[str]:
         "accept-charset": "UTF-8",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
-
     for auth_url in AUTH_SERVERS:
         try:
             resp = session.post(auth_url, data=payload, headers=headers, timeout=15)
@@ -102,17 +93,15 @@ def login_and_get_token() -> Optional[str]:
                 else:
                     logger.error(f"响应中无 access_token: {auth_url}")
             else:
-                logger.warning(f"认证服务器 {auth_url} 返回状态码 {resp.status_code}: {resp.text[:200]}")
+                logger.warning(f"认证服务器 {auth_url} 返回状态码 {resp.status_code}")
         except Exception as e:
             logger.warning(f"连接认证服务器 {auth_url} 异常: {e}")
-    
     logger.error("所有认证服务器均失败")
     return None
 
-# ==================== 节点列表获取（多地址容灾） ====================
+# ==================== 节点列表（多地址容灾） ====================
 @retry_request(max_retries=4, backoff_factor=2.0)
 def get_node_list(token: str) -> List[Dict]:
-    """获取节点列表，自动尝试多个 API 服务器"""
     logger.info("正在获取节点列表...")
     headers = {
         "User-Agent": "ktor-client",
@@ -122,7 +111,6 @@ def get_node_list(token: str) -> List[Dict]:
         "accept-charset": "UTF-8",
         "Content-Type": "application/json",
     }
-
     for api_url in API_SERVERS:
         url = f"{api_url}/nodeList?platform=android"
         try:
@@ -138,13 +126,11 @@ def get_node_list(token: str) -> List[Dict]:
                 logger.warning(f"API 服务器 {api_url} 返回状态码 {resp.status_code}")
         except Exception as e:
             logger.warning(f"连接 API 服务器 {api_url} 异常: {e}")
-    
     raise Exception("所有 API 服务器均无法获取节点列表")
 
-# ==================== 节点配置获取（多地址容灾） ====================
+# ==================== 节点配置（多地址容灾） ====================
 @retry_request(max_retries=4, backoff_factor=2.0)
 def get_client_config(node_id: int, token: str) -> Optional[Dict]:
-    """获取单个节点的客户端配置，自动尝试多个 API 服务器"""
     payload = {"nodeId": node_id}
     headers = {
         "User-Agent": "ktor-client",
@@ -154,7 +140,6 @@ def get_client_config(node_id: int, token: str) -> Optional[Dict]:
         "accept-charset": "UTF-8",
         "Content-Type": "application/json",
     }
-
     for api_url in API_SERVERS:
         url = f"{api_url}/clientConfig"
         try:
@@ -165,49 +150,69 @@ def get_client_config(node_id: int, token: str) -> Optional[Dict]:
                 logger.warning(f"节点 {node_id} 从 {api_url} 获取配置失败: HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"节点 {node_id} 连接 {api_url} 异常: {e}")
-    
     raise Exception(f"所有 API 服务器均无法获取节点 {node_id} 的配置")
 
-# ==================== 链接生成（与原改进版完全一致） ====================
+# ==================== 节点名称提取 ====================
 def extract_node_name(node: Dict) -> str:
-    """从节点信息提取名称"""
-    if name := node.get("nameCn"):
-        return name.strip()
-    if name := node.get("nameEn"):
-        return name.strip()
+    """从节点信息提取名称（与火种.py一致，更丰富）"""
+    name_parts = []
     if region := node.get("regionNameCn"):
-        return f"{region.strip()} 节点"
-    return f"Node-{node.get('nodeId', '未知')}"
+        name_parts.append(region.strip())
+    if name := node.get("nameCn"):
+        name_parts.append(name.strip())
+    elif name := node.get("nameEn"):
+        name_parts.append(name.strip())
+    if tag := node.get("tagCn"):
+        name_parts.append(f"({tag.strip()})")
+    return " - ".join(name_parts) if name_parts else f"Node-{node.get('nodeId', '未知')}"
 
+# ==================== 链接生成（包含 WS 的 path/host，无 alpn） ====================
 def generate_vless_link(config: Dict, node_name: str) -> str:
-    """生成 VLESS 链接（支持 reality 和普通 tls）"""
+    """生成 VLESS 链接，支持 reality/tls，包含 WebSocket 的 path 和 host"""
     vnext = config["settings"]["vnext"][0]
     user = vnext["users"][0]
     stream = config["streamSettings"]
+    network = stream.get("network", "tcp")
+
+    params = {
+        "encryption": user.get("encryption", "none"),
+        "type": network,
+    }
 
     if stream.get("security") == "reality":
-        reality = stream["realitySettings"]
-        params = {
+        reality = stream.get("realitySettings", {})
+        params.update({
             "security": "reality",
-            "encryption": user.get("encryption", "none"),
-            "pbk": reality["publicKey"],
+            "pbk": reality.get("publicKey", ""),
+            "fp": reality.get("fingerprint", "chrome"),
+            "sni": reality.get("serverName", ""),
+            "sid": reality.get("shortId", ""),
             "headerType": "none",
-            "fp": reality["fingerprint"],
-            "type": stream["network"],
-            "sni": reality["serverName"],
-            "sid": reality["shortId"],
-        }
-    else:
-        params = {"security": stream.get("security", "none")}
+        })
+    elif stream.get("security") == "tls":
+        tls = stream.get("tlsSettings", {})
+        params["security"] = "tls"
+        if sni := tls.get("serverName"):
+            params["sni"] = sni
+        if tls.get("allowInsecure") is not None:
+            params["allowInsecure"] = "1" if tls.get("allowInsecure") else "0"
+        if fp := tls.get("fingerprint"):
+            params["fp"] = fp
+        # 不添加 alpn
+
+    if network == "ws":
+        ws = stream.get("wsSettings", {})
+        if path := ws.get("path"):
+            params["path"] = path
+        # host 取自 sni，或默认
+        params["host"] = params.get("sni", "vpn-node.internal")
 
     query = urllib.parse.urlencode(params)
     remark = urllib.parse.quote(node_name)
     return f"vless://{user['id']}@{vnext['address']}:{vnext['port']}?{query}#{remark}"
 
 def generate_trojan_link(config: Dict, node_name: str) -> str:
-    """
-    生成 Trojan 链接
-    """
+    """生成 Trojan 链接，包含 WS 的 path/host 和 grpc 的 serviceName"""
     servers = config.get("settings", {}).get("servers", [])
     if not servers:
         raise ValueError("配置中缺少 servers 字段")
@@ -222,20 +227,26 @@ def generate_trojan_link(config: Dict, node_name: str) -> str:
     network = stream.get("network", "tcp")
     security = stream.get("security", "")
     tls_settings = stream.get("tlsSettings", {})
+    ws_settings = stream.get("wsSettings", {})
     grpc_settings = stream.get("grpcSettings", {})
 
     params = {}
-    if security:
-        params["security"] = security
-    if tls_settings.get("allowInsecure") is not None:
-        params["allowInsecure"] = str(tls_settings["allowInsecure"]).lower()
-    if sni := tls_settings.get("serverName"):
-        params["sni"] = sni
-    if fp := tls_settings.get("fingerprint"):
-        params["fp"] = fp
-    if network:
-        params["type"] = network
-    if network == "grpc" and (svc := grpc_settings.get("serviceName")):
+    if security == "tls":
+        params["security"] = "tls"
+        if sni := tls_settings.get("serverName"):
+            params["sni"] = sni
+        if tls_settings.get("allowInsecure") is not None:
+            params["allowInsecure"] = "1" if tls_settings.get("allowInsecure") else "0"
+        if fp := tls_settings.get("fingerprint"):
+            params["fp"] = fp
+        # 不添加 alpn
+
+    params["type"] = network
+    if network == "ws":
+        if path := ws_settings.get("path"):
+            params["path"] = path
+        params["host"] = tls_settings.get("serverName", "vpn-node.internal")
+    elif network == "grpc" and (svc := grpc_settings.get("serviceName")):
         params["serviceName"] = svc
 
     query = urllib.parse.urlencode(params)
@@ -243,13 +254,11 @@ def generate_trojan_link(config: Dict, node_name: str) -> str:
     return f"trojan://{password}@{address}:{port}?{query}#{remark}"
 
 def save_link(link: str):
-    """将链接追加写入输出文件"""
     with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
         f.write(f"{link}\n")
 
 # ==================== 主程序 ====================
 def main():
-    # 检查环境变量
     if not all([USERNAME, PASSWORD, CLIENT_SECRET]):
         logger.error("缺少必需的环境变量: HZ_USERNAME, HZ_PASSWORD, HZ_CLIENT_SECRET")
         sys.exit(1)
@@ -258,16 +267,14 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         pass
 
-    logger.info("火种VPN - 自动登录 + 提取链接 (支持 VLESS / Trojan)")
+    logger.info("火种VPN - 自动登录 + 提取链接 (支持 VLESS / Trojan，完整 WS 支持)")
     logger.info(f"输出文件: {OUTPUT_FILE}")
 
-    # 1. 登录获取 Token
     token = login_and_get_token()
     if not token:
         logger.error("登录失败，终止")
         sys.exit(1)
 
-    # 2. 获取节点列表
     try:
         nodes = get_node_list(token)
     except Exception as e:
