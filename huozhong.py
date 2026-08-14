@@ -334,7 +334,7 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main())
+    main()
 logger = logging.getLogger(__name__)
 
 # ==================== 会话与重试装饰器 ====================
